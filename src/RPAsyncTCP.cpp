@@ -6,6 +6,7 @@
 
 #include "RPAsyncTCP.h"
 #include "RPAsyncTCP_Debug.h"
+#include <lwip_wrap.h>
 
 extern "C"
 {
@@ -139,7 +140,6 @@ AsyncClient::AsyncClient(tcp_pcb * pcb):
   , _ack_pcb(true)
   , _tx_unacked_len(0)
   , _tx_acked_len(0)
-  , _tx_unsent_len(0)
   , _rx_ack_len(0)
   , _rx_last_packet(0)
   , _rx_since_timeout(0)
@@ -481,6 +481,11 @@ size_t AsyncClient::add(const char* data, size_t size, uint8_t apiflags)
 #endif
 
   size_t will_send = (room < size) ? room : size;
+
+  // lwIP can transmit the queued data (and the peer ACK it) from its packet
+  // handling context before send() runs, so count it as unacked under the
+  // same lock, or _sent() would subtract it before it is counted
+  LWIPMutex lock;
   err_t err = tcp_write(_pcb, data, will_send, apiflags);
 
   if (err != ERR_OK)
@@ -488,7 +493,7 @@ size_t AsyncClient::add(const char* data, size_t size, uint8_t apiflags)
     return 0;
   }
 
-  _tx_unsent_len += will_send;
+  _tx_unacked_len += will_send;
 
   return will_send;
 }
@@ -502,19 +507,21 @@ bool AsyncClient::send()
     return true;
 #endif
 
+  LWIPMutex lock;
   err_t err = tcp_output(_pcb);
 
   if (err == ERR_OK)
   {
-    _pcb_busy = true;
-    _pcb_sent_at = millis();
-    _tx_unacked_len += _tx_unsent_len;
-    _tx_unsent_len = 0;
+    // Busy only while something is still waiting for an ACK; if it was all
+    // ACKed already, no _sent() would come to clear it
+    if (_tx_unacked_len > 0)
+    {
+      _pcb_busy = true;
+      _pcb_sent_at = millis();
+    }
 
     return true;
   }
-
-  _tx_unsent_len = 0;
 
   return false;
 }
@@ -699,7 +706,7 @@ void AsyncClient::_sent(std::shared_ptr<ACErrorTracker>& errorTracker, tcp_pcb* 
 #endif
 
   _rx_last_packet  = millis();
-  _tx_unacked_len -= len;
+  _tx_unacked_len = (len < _tx_unacked_len) ? _tx_unacked_len - len : 0;
   _tx_acked_len   += len;
 
   ATCP_LOGDEBUG3("_sent: ID =", errorTracker->getConnectionId(), ", len =", len);

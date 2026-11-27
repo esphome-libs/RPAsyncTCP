@@ -410,6 +410,8 @@ void AsyncClient::abort()
 // the running lwIP callback, if any, return it. The caller clears _pcb.
 void AsyncClient::_abort_pcb()
 {
+  // One lock across detach and abort, so an lwIP IRQ cannot land between them
+  LWIPMutex lock;
   clearTcpCallbacks(_pcb);
   tcp_abort(_pcb);
   setCloseError(ERR_ABRT);
@@ -647,18 +649,21 @@ void AsyncClient::_close()
     }
 #endif
 
-    clearTcpCallbacks(_pcb);
-    err_t err = tcp_close(_pcb);
-
-    if (ERR_OK == err)
     {
-      setCloseError(err);
-    }
-    else
-    {
-      ATCP_LOGDEBUG3("_close : ID =", getConnectionId(), ", tcp_close failed, aborting AsyncClient 0x", uintptr_t(this));
+      LWIPMutex lock;
+      clearTcpCallbacks(_pcb);
+      err_t err = tcp_close(_pcb);
 
-      _abort_pcb();
+      if (ERR_OK == err)
+      {
+        setCloseError(err);
+      }
+      else
+      {
+        ATCP_LOGDEBUG3("_close : ID =", getConnectionId(), ", tcp_close failed, aborting AsyncClient 0x", uintptr_t(this));
+
+        _abort_pcb();
+      }
     }
 
     _pcb = NULL;
@@ -690,12 +695,19 @@ void AsyncClient::_error(err_t err)
     _pcb = NULL;
   }
 
+  _notify_error(err);
+}
+
+/////////////////////////////////////////////////
+
+// Runs onError, then onDisconnect unless onError deleted the client or started a new connection
+void AsyncClient::_notify_error(err_t err)
+{
   auto errorTracker = _errorTracker;
 
   if (_error_cb)
     _error_cb(_error_cb_arg, this, err);
 
-  // onError may have deleted the client
   if (errorTracker->hasClient() && _discard_cb)
     _discard_cb(_discard_cb_arg, this);
 }
@@ -953,7 +965,7 @@ void AsyncClient::_dns_found(ip_addr_t *p)
   }
   else
   {
-    _error(-55);
+    _notify_error(-55);
   }
 }
 
@@ -1689,6 +1701,8 @@ void AsyncServer::end()
 {
   if (_pcb)
   {
+    // One lock across detach and close: an accept IRQ between them would get a NULL arg
+    LWIPMutex lock;
     //cleanup all connections?
     tcp_arg(_pcb, NULL);
     tcp_accept(_pcb, NULL);

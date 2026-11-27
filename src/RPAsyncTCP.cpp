@@ -223,11 +223,12 @@ AsyncClient::~AsyncClient()
 
 inline void clearTcpCallbacks(tcp_pcb* pcb)
 {
-  tcp_arg(pcb, NULL);
+  // The arg goes last: FreeRTOS builds queue each call, and a callback still set must not see a NULL arg
   tcp_sent(pcb, NULL);
   tcp_recv(pcb, NULL);
   tcp_err(pcb, NULL);
   tcp_poll(pcb, NULL, 0);
+  tcp_arg(pcb, NULL);
 }
 
 /////////////////////////////////////////////////
@@ -1714,11 +1715,12 @@ void AsyncServer::end()
 {
   if (_pcb)
   {
-    // One lock across detach and close: an accept IRQ between them would get a NULL arg
+    // One lock across detach and close: an accept IRQ between them would get a NULL arg.
+    // The arg goes last for FreeRTOS builds, which queue each call and ignore the lock.
     LWIPMutex lock;
     //cleanup all connections?
-    tcp_arg(_pcb, NULL);
     tcp_accept(_pcb, NULL);
+    tcp_arg(_pcb, NULL);
 
     if (tcp_close(_pcb) != ERR_OK)
     {

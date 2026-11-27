@@ -396,6 +396,18 @@ bool AsyncClient::operator==(const AsyncClient &other) const
 
 void AsyncClient::abort()
 {
+  // Notes:
+  // 1) _pcb is set to NULL, so we cannot call tcp_abort() more than once.
+  // 2) setCloseError(ERR_ABRT) is only done in _abort_pcb()!
+  // 3) Using this abort() function guarantees only one tcp_abort() call is
+  //    made and only one CB returns with ERR_ABORT.
+  // 4) After abort() is called from _close(), no callbacks with an err
+  //    parameter will be called.  eg. _recv(), _error(), _connected().
+  //    _close() will reset there CB handlers before calling.
+  // 5) A callback to _error(), will set _pcb to NULL, thus avoiding the
+  //    of a 2nd call to tcp_abort().
+  // 6) Callbacks to _recv() or _connected() with err set, will result in _pcb
+  //    set to NULL. Thus, preventing possible calls later to tcp_abort().
   if (!_pcb)
     return;
 
@@ -691,7 +703,8 @@ void AsyncClient::_error(err_t err)
     }
 #endif
 
-    // The pcb is already freed (by lwIP or _abort_pcb()); only the pointer is cleared
+    // At this callback _pcb is possible already freed. Thus, no calls are
+    // made to set to NULL other callbacks.
     _pcb = NULL;
   }
 

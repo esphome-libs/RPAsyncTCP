@@ -91,7 +91,16 @@ void ACErrorTracker::setErrored(size_t errorEvent)
 err_t ACErrorTracker::getCallbackCloseError()
 {
   if (EE_OK != _errored)
+  {
+    // lwIP aborted the pcb while its callback ran (tcp_kill_* when the callback allocated a pcb)
+    if (EE_ERROR_CB == _errored && ERR_ABRT == _close_error)
+    {
+      _errored = EE_ABORTED;
+      return ERR_ABRT;
+    }
+
     return ERR_OK;
+  }
 
   if (ERR_ABRT == _close_error)
     setErrored(EE_ABORTED);
@@ -183,6 +192,16 @@ AsyncClient::AsyncClient(tcp_pcb * pcb):
 #endif
   }
 
+  _resetErrorTracker();
+}
+
+/////////////////////////////////////////////////
+
+void AsyncClient::_resetErrorTracker()
+{
+  if (_errorTracker)
+    _errorTracker->clearClient();
+
   _errorTracker = std::make_shared<ACErrorTracker>(this);
 
 #if DEBUG_ESP_ASYNC_TCP
@@ -204,11 +223,12 @@ AsyncClient::~AsyncClient()
 
 inline void clearTcpCallbacks(tcp_pcb* pcb)
 {
-  tcp_arg(pcb, NULL);
+  // The arg goes last: FreeRTOS builds queue each call, and a callback still set must not see a NULL arg
   tcp_sent(pcb, NULL);
   tcp_recv(pcb, NULL);
   tcp_err(pcb, NULL);
   tcp_poll(pcb, NULL, 0);
+  tcp_arg(pcb, NULL);
 }
 
 /////////////////////////////////////////////////
@@ -251,6 +271,10 @@ bool AsyncClient::connect(IPAddress ip, uint16_t port)
 
     return false;
   }
+
+  // A fresh tracker per connection: an abort outside a callback leaves ERR_ABRT behind
+  // that must not reach the next connection's callbacks
+  _resetErrorTracker();
 
   //tcp_setprio(_pcb, TCP_PRIO_MIN);
   tcp_setprio(_pcb, TCP_PRIO_NORMAL);
@@ -375,7 +399,7 @@ void AsyncClient::abort()
 {
   // Notes:
   // 1) _pcb is set to NULL, so we cannot call tcp_abort() more than once.
-  // 2) setCloseError(ERR_ABRT) is only done here!
+  // 2) setCloseError(ERR_ABRT) is only done in _abort_pcb()!
   // 3) Using this abort() function guarantees only one tcp_abort() call is
   //    made and only one CB returns with ERR_ABORT.
   // 4) After abort() is called from _close(), no callbacks with an err
@@ -385,15 +409,25 @@ void AsyncClient::abort()
   //    of a 2nd call to tcp_abort().
   // 6) Callbacks to _recv() or _connected() with err set, will result in _pcb
   //    set to NULL. Thus, preventing possible calls later to tcp_abort().
+  if (!_pcb)
+    return;
 
-  if (_pcb)
-  {
-    tcp_abort(_pcb);
-    _pcb = NULL;
-    setCloseError(ERR_ABRT);
-  }
+  _abort_pcb();
+  // Frees TLS and clears _pcb; the handlers may delete this
+  _error(ERR_ABRT);
+}
 
-  return;
+/////////////////////////////////////////////////
+
+// tcp_abort() frees the pcb before it runs the error callback, so detach first. ERR_ABRT makes
+// the running lwIP callback, if any, return it. The caller clears _pcb.
+void AsyncClient::_abort_pcb()
+{
+  // One lock across detach and abort, so an lwIP IRQ cannot land between them
+  LWIPMutex lock;
+  clearTcpCallbacks(_pcb);
+  tcp_abort(_pcb);
+  setCloseError(ERR_ABRT);
 }
 
 /////////////////////////////////////////////////
@@ -628,18 +662,21 @@ void AsyncClient::_close()
     }
 #endif
 
-    clearTcpCallbacks(_pcb);
-    err_t err = tcp_close(_pcb);
-
-    if (ERR_OK == err)
     {
-      setCloseError(err);
-    }
-    else
-    {
-      ATCP_LOGDEBUG3("_close : ID =", getConnectionId(), ", abort() called for AsyncClient 0x", uintptr_t(this));
+      LWIPMutex lock;
+      clearTcpCallbacks(_pcb);
+      err_t err = tcp_close(_pcb);
 
-      abort();
+      if (ERR_OK == err)
+      {
+        setCloseError(err);
+      }
+      else
+      {
+        ATCP_LOGDEBUG3("_close : ID =", getConnectionId(), ", tcp_close failed, aborting AsyncClient 0x", uintptr_t(this));
+
+        _abort_pcb();
+      }
     }
 
     _pcb = NULL;
@@ -669,18 +706,23 @@ void AsyncClient::_error(err_t err)
 
     // At this callback _pcb is possible already freed. Thus, no calls are
     // made to set to NULL other callbacks.
-    // KH add, from v1.1.0, to free _pcb
-    clearTcpCallbacks(_pcb);
-    tcp_close(_pcb);
-    //////
-
     _pcb = NULL;
   }
+
+  _notify_error(err);
+}
+
+/////////////////////////////////////////////////
+
+// Runs onError, then onDisconnect unless onError deleted the client or started a new connection
+void AsyncClient::_notify_error(err_t err)
+{
+  auto errorTracker = _errorTracker;
 
   if (_error_cb)
     _error_cb(_error_cb_arg, this, err);
 
-  if (_discard_cb)
+  if (errorTracker->hasClient() && _discard_cb)
     _discard_cb(_discard_cb_arg, this);
 }
 
@@ -818,7 +860,8 @@ void AsyncClient::_recv(std::shared_ptr<ACErrorTracker>& errorTracker, tcp_pcb* 
     // then it is assummed we freed the pbufs.
     // https://www.nongnu.org/lwip/2_1_x/group__tcp__raw.html#ga8afd0b316a87a5eeff4726dc95006ed0
 
-    if (!errorTracker->hasClient())
+    // Drop the rest of the chain once a callback deleted the client or closed the connection
+    if (!errorTracker->hasClient() || _pcb != pcb)
     {
       while (pb != NULL)
       {
@@ -849,7 +892,7 @@ void AsyncClient::_recv(std::shared_ptr<ACErrorTracker>& errorTracker, tcp_pcb* 
         _recv_cb(_recv_cb_arg, this, b->payload, b->len);
       }
 
-      if (errorTracker->hasClient())
+      if (errorTracker->hasClient() && _pcb == pcb)
       {
         if (!_ack_pcb)
           _rx_ack_len += b->len;
@@ -936,11 +979,7 @@ void AsyncClient::_dns_found(ip_addr_t *p)
   }
   else
   {
-    if (_error_cb)
-      _error_cb(_error_cb_arg, this, -55);
-
-    if (_discard_cb)
-      _discard_cb(_discard_cb_arg, this);
+    _notify_error(-55);
   }
 }
 
@@ -1676,9 +1715,12 @@ void AsyncServer::end()
 {
   if (_pcb)
   {
+    // One lock across detach and close: an accept IRQ between them would get a NULL arg.
+    // The arg goes last for FreeRTOS builds, which queue each call and ignore the lock.
+    LWIPMutex lock;
     //cleanup all connections?
-    tcp_arg(_pcb, NULL);
     tcp_accept(_pcb, NULL);
+    tcp_arg(_pcb, NULL);
 
     if (tcp_close(_pcb) != ERR_OK)
     {
